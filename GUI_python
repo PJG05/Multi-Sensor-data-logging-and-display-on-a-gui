@@ -1,0 +1,527 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import serial
+import serial.tools.list_ports
+import threading
+import re
+import math
+
+class ArtificialHorizon(tk.Canvas):
+    def __init__(self, parent, size=300):
+        super().__init__(parent, width=size, height=size, bg='#0a0a0a', highlightthickness=2, highlightbackground='white')
+        self.size = size
+        self.center_x = size // 2
+        self.center_y = size // 2
+        self.roll = 0   # degrees
+        self.pitch = 0  # degrees
+        self.draw_horizon()
+    
+    def draw_horizon(self):
+        self.delete("all")
+        
+        # Calculate pitch offset (pixels per degree)
+        pitch_offset = self.pitch * 3
+        
+        # Rotation angle in radians
+        roll_rad = math.radians(self.roll)
+        
+        # Simple horizon rendering - just sky, ground, and line
+        horizon_y = self.center_y + pitch_offset
+        
+        # Draw sky as blue
+        self.create_rectangle(0, 0, self.size, horizon_y, fill='#1e90ff', outline='', stipple='')
+        
+        # Draw ground as brown
+        self.create_rectangle(0, horizon_y, self.size, self.size, fill='#8b4513', outline='', stipple='')
+        
+        # Draw horizon line
+        line_len = self.size
+        x1 = self.center_x - line_len * math.cos(roll_rad)
+        y1 = horizon_y - line_len * math.sin(roll_rad)
+        x2 = self.center_x + line_len * math.cos(roll_rad)
+        y2 = horizon_y + line_len * math.sin(roll_rad)
+        
+        self.create_line(x1, y1, x2, y2, fill='white', width=3)
+        
+        # Draw pitch lines (fewer for speed)
+        for pitch_val in [-20, -10, 10, 20]:
+            py = self.center_y + pitch_offset + (pitch_val * 3)
+            px1 = self.center_x - 30
+            px2 = self.center_x + 30
+            
+            # Rotate pitch lines
+            rx1 = (px1 - self.center_x) * math.cos(roll_rad) - (py - self.center_y) * math.sin(roll_rad) + self.center_x
+            ry1 = (px1 - self.center_x) * math.sin(roll_rad) + (py - self.center_y) * math.cos(roll_rad) + self.center_y
+            rx2 = (px2 - self.center_x) * math.cos(roll_rad) - (py - self.center_y) * math.sin(roll_rad) + self.center_x
+            ry2 = (px2 - self.center_x) * math.sin(roll_rad) + (py - self.center_y) * math.cos(roll_rad) + self.center_y
+            
+            self.create_line(rx1, ry1, rx2, ry2, fill='white', width=2)
+            self.create_text(rx2 + 15, ry2, text=str(-pitch_val), fill='white', font=('Arial', 9))
+        
+        # Draw aircraft symbol (fixed in center)
+        self.create_line(self.center_x-40, self.center_y, self.center_x-5, self.center_y, fill='yellow', width=4)
+        self.create_line(self.center_x+5, self.center_y, self.center_x+40, self.center_y, fill='yellow', width=4)
+        self.create_oval(self.center_x-3, self.center_y-3, self.center_x+3, self.center_y+3, fill='yellow')
+        
+        # Draw outer circle
+        self.create_oval(5, 5, self.size-5, self.size-5, outline='white', width=3)
+    
+    def update_attitude(self, roll, pitch):
+        self.roll = roll
+        self.pitch = pitch
+        self.draw_horizon()
+
+
+class SensorDisplay(tk.Frame):
+    def __init__(self, parent, title, unit, color='#00ff00'):
+        super().__init__(parent, bg='#1a1a1a', relief=tk.RAISED, borderwidth=2)
+        self.color = color
+        
+        tk.Label(self, text=title, font=('Arial', 9, 'bold'), 
+                bg='#1a1a1a', fg='#888888').pack(pady=2)
+        
+        self.value_label = tk.Label(self, text='--', font=('Arial', 18, 'bold'),
+                                    bg='#1a1a1a', fg=color)
+        self.value_label.pack(pady=5)
+        
+        tk.Label(self, text=unit, font=('Arial', 8),
+                bg='#1a1a1a', fg='#666666').pack()
+    
+    def update_value(self, value):
+        try:
+            if isinstance(value, str):
+                self.value_label.config(text=value)
+            else:
+                formatted_value = f"{float(value):.2f}"
+                self.value_label.config(text=formatted_value)
+        except:
+            self.value_label.config(text='--')
+
+
+class AvionicDisplayGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Avionic Display - Multi-Sensor Monitor")
+        self.root.configure(bg='#0d0d0d')
+        
+        self.serial_port = None
+        self.running = False
+        
+        # Data storage with integration for gyro
+        self.sensor_data = {
+            'accel_x': 0.0, 'accel_y': 0.0, 'accel_z': 0.0,
+            'gyro_x': 0.0, 'gyro_y': 0.0, 'gyro_z': 0.0,
+            'temp_mpu': 0.0,
+            'heart_rate': 0.0, 'spo2': 0.0,
+            'red_led': 0, 'ir_led': 0, 'ratio': 0.0,
+            'temp_bmp': 0.0, 'pressure': 0.0, 'altitude': 0.0
+        }
+        
+        # HR/SpO2 calculation buffers
+        self.red_buffer = []
+        self.ir_buffer = []
+        self.buffer_size = 100  # Store 100 samples for HR calculation
+        
+        # Integrated angles for gyroscope
+        self.integrated_roll = 0.0
+        self.integrated_pitch = 0.0
+        self.last_update_time = None
+        
+        self.setup_ui()
+    
+    def setup_ui(self):
+        # Top control panel
+        control_frame = tk.Frame(self.root, bg='#1a1a1a', relief=tk.RAISED, borderwidth=2)
+        control_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        tk.Label(control_frame, text="Serial Port:", bg='#1a1a1a', fg='white', 
+                font=('Arial', 10)).pack(side=tk.LEFT, padx=5)
+        
+        self.port_combo = ttk.Combobox(control_frame, width=15, state='readonly')
+        self.port_combo.pack(side=tk.LEFT, padx=5)
+        self.refresh_ports()
+        
+        tk.Button(control_frame, text="Refresh", command=self.refresh_ports,
+                 bg='#333333', fg='white', relief=tk.RAISED, padx=10).pack(side=tk.LEFT, padx=5)
+        
+        self.connect_btn = tk.Button(control_frame, text="Connect", command=self.toggle_connection,
+                                     bg='#005500', fg='white', font=('Arial', 10, 'bold'), 
+                                     relief=tk.RAISED, padx=15)
+        self.connect_btn.pack(side=tk.LEFT, padx=10)
+        
+        self.status_label = tk.Label(control_frame, text="● Disconnected", 
+                                     bg='#1a1a1a', fg='#ff3333', font=('Arial', 10, 'bold'))
+        self.status_label.pack(side=tk.LEFT, padx=20)
+        
+        tk.Button(control_frame, text="Reset Horizon", command=self.reset_horizon,
+                 bg='#333333', fg='white', relief=tk.RAISED, padx=10).pack(side=tk.RIGHT, padx=5)
+        
+        # Main display area
+        main_frame = tk.Frame(self.root, bg='#0d0d0d')
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Left panel - Artificial Horizon
+        left_frame = tk.Frame(main_frame, bg='#0d0d0d')
+        left_frame.pack(side=tk.LEFT, padx=10)
+        
+        tk.Label(left_frame, text="ARTIFICIAL HORIZON", font=('Arial', 12, 'bold'),
+                bg='#0d0d0d', fg='#00ff00').pack(pady=5)
+        
+        self.horizon = ArtificialHorizon(left_frame, size=320)
+        self.horizon.pack(pady=10)
+        
+        # Attitude info
+        attitude_frame = tk.Frame(left_frame, bg='#1a1a1a', relief=tk.RAISED, borderwidth=2)
+        attitude_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Label(attitude_frame, text="ATTITUDE", font=('Arial', 10, 'bold'),
+                bg='#1a1a1a', fg='white').pack(pady=5)
+        
+        self.roll_label = tk.Label(attitude_frame, text="Roll: 0.0°",
+                                   font=('Arial', 11, 'bold'), bg='#1a1a1a', fg='#00ffff')
+        self.roll_label.pack(pady=2)
+        
+        self.pitch_label = tk.Label(attitude_frame, text="Pitch: 0.0°", 
+                                    font=('Arial', 11, 'bold'), bg='#1a1a1a', fg='#00ffff')
+        self.pitch_label.pack(pady=2)
+        
+        # Gyro rates
+        gyro_frame = tk.Frame(left_frame, bg='#1a1a1a', relief=tk.RAISED, borderwidth=2)
+        gyro_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(gyro_frame, text="GYRO RATES", font=('Arial', 9, 'bold'),
+                bg='#1a1a1a', fg='white').pack(pady=2)
+        
+        self.gyro_label = tk.Label(gyro_frame, text="X: 0.0  Y: 0.0  Z: 0.0 °/s",
+                                   font=('Arial', 9), bg='#1a1a1a', fg='#ffff00')
+        self.gyro_label.pack(pady=5)
+        
+        # Right panel - Sensor data
+        right_frame = tk.Frame(main_frame, bg='#0d0d0d')
+        right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
+        
+        tk.Label(right_frame, text="SENSOR TELEMETRY", font=('Arial', 12, 'bold'),
+                bg='#0d0d0d', fg='#00ff00').pack(pady=5)
+        
+        # Create sensor displays in grid
+        sensors_container = tk.Frame(right_frame, bg='#0d0d0d')
+        sensors_container.pack(fill=tk.BOTH, expand=True, pady=10)
+        
+        # Row 1
+        row1 = tk.Frame(sensors_container, bg='#0d0d0d')
+        row1.pack(fill=tk.X, pady=5)
+        
+        self.temp_display = SensorDisplay(row1, "TEMPERATURE", "°C", '#ff6600')
+        self.temp_display.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+        
+        self.pressure_display = SensorDisplay(row1, "PRESSURE", "hPa", '#ffff00')
+        self.pressure_display.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+        
+        # Row 2
+        row2 = tk.Frame(sensors_container, bg='#0d0d0d')
+        row2.pack(fill=tk.X, pady=5)
+        
+        self.altitude_display = SensorDisplay(row2, "ALTITUDE", "m", '#00ff00')
+        self.altitude_display.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+        
+        self.hr_display = SensorDisplay(row2, "HEART RATE", "bpm", '#ff0000')
+        self.hr_display.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+        
+        # Row 3
+        row3 = tk.Frame(sensors_container, bg='#0d0d0d')
+        row3.pack(fill=tk.X, pady=5)
+        
+        self.spo2_display = SensorDisplay(row3, "SpO2", "%", '#00ffff')
+        self.spo2_display.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+        
+        self.temp_mpu_display = SensorDisplay(row3, "MPU TEMP", "°C", '#ff9900')
+        self.temp_mpu_display.pack(side=tk.LEFT, padx=5, fill=tk.BOTH, expand=True)
+        
+        # Accelerometer display
+        accel_frame = tk.Frame(sensors_container, bg='#1a1a1a', relief=tk.RAISED, borderwidth=2)
+        accel_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Label(accel_frame, text="ACCELEROMETER", font=('Arial', 10, 'bold'),
+                bg='#1a1a1a', fg='white').pack(pady=2)
+        
+        self.accel_label = tk.Label(accel_frame, text="X: 0.00g  Y: 0.00g  Z: 0.00g",
+                                    font=('Arial', 11, 'bold'), bg='#1a1a1a', fg='#00ff00')
+        self.accel_label.pack(pady=5)
+        
+        # LED readings
+        led_frame = tk.Frame(sensors_container, bg='#1a1a1a', relief=tk.RAISED, borderwidth=2)
+        led_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(led_frame, text="MAX30102 LED", font=('Arial', 9, 'bold'),
+                bg='#1a1a1a', fg='white').pack(pady=2)
+        
+        self.led_label = tk.Label(led_frame, text="Red: 0  IR: 0",
+                                 font=('Arial', 9), bg='#1a1a1a', fg='#ff6666')
+        self.led_label.pack(pady=5)
+    
+    def refresh_ports(self):
+        ports = serial.tools.list_ports.comports()
+        port_list = [port.device for port in ports]
+        self.port_combo['values'] = port_list
+        if port_list:
+            self.port_combo.current(0)
+    
+    def toggle_connection(self):
+        if not self.running:
+            self.connect()
+        else:
+            self.disconnect()
+    
+    def connect(self):
+        port = self.port_combo.get()
+        if not port:
+            messagebox.showerror("Error", "Please select a serial port")
+            return
+        
+        try:
+            self.serial_port = serial.Serial(port, 115200, timeout=0.1)
+            self.running = True
+            self.last_update_time = None
+            self.connect_btn.config(text="Disconnect", bg='#550000')
+            self.status_label.config(text="● Connected", fg='#00ff00')
+            
+            # Start reading thread
+            self.read_thread = threading.Thread(target=self.read_serial, daemon=True)
+            self.read_thread.start()
+            
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"Failed to connect:\n{str(e)}")
+    
+    def disconnect(self):
+        self.running = False
+        if self.serial_port and self.serial_port.is_open:
+            self.serial_port.close()
+        self.connect_btn.config(text="Connect", bg='#005500')
+        self.status_label.config(text="● Disconnected", fg='#ff3333')
+    
+    def calculate_heart_rate(self, red_samples):
+        """Calculate heart rate from red LED samples using peak detection"""
+        if len(red_samples) < 20:
+            return 0.0
+        
+        # Calculate threshold as mean + some percentage
+        mean_val = sum(red_samples) / len(red_samples)
+        threshold = mean_val * 1.05  # 5% above mean
+        
+        # Find peaks
+        peaks = []
+        for i in range(1, len(red_samples) - 1):
+            if (red_samples[i] > threshold and 
+                red_samples[i] > red_samples[i-1] and 
+                red_samples[i] > red_samples[i+1]):
+                peaks.append(i)
+        
+        # Calculate HR from number of peaks
+        if len(peaks) >= 2:
+            # Assume samples are at ~100Hz (adjust based on your sampling rate)
+            time_span = len(red_samples) / 100.0  # seconds
+            bpm = (len(peaks) / time_span) * 60.0
+            
+            # Clamp to reasonable range
+            if 40 <= bpm <= 200:
+                return bpm
+        
+        return 0.0
+    
+    def calculate_spo2(self, ratio):
+        """Calculate SpO2 from R/IR ratio using empirical formula"""
+        if ratio <= 0 or ratio < 0.4 or ratio > 2.0:
+            return 0.0
+        
+        # Empirical SpO2 calculation formula
+        # Based on typical calibration curves for MAX30102
+        # SpO2 = 110 - 25*R (simplified linear approximation)
+        spo2 = 110.0 - (25.0 * ratio)
+        
+        # Alternative formula (more accurate for typical range):
+        # spo2 = -45.060 * ratio**2 + 30.354 * ratio + 94.845
+        
+        # Clamp to valid physiological range
+        if spo2 > 100.0:
+            spo2 = 100.0
+        elif spo2 < 70.0:
+            spo2 = 70.0
+        
+        return spo2
+    
+    def reset_horizon(self):
+        self.integrated_roll = 0.0
+        self.integrated_pitch = 0.0
+        self.last_update_time = None
+        self.horizon.update_attitude(0, 0)
+        self.roll_label.config(text="Roll: 0.0°")
+        self.pitch_label.config(text="Pitch: 0.0°")
+    
+    def parse_serial_data(self, line):
+        try:
+            # Parse MPU6050 Accelerometer
+            if "Accel:" in line:
+                match = re.search(r'X=\s*([+-]?\d+\.?\d*)\s*g.*Y=\s*([+-]?\d+\.?\d*)\s*g.*Z=\s*([+-]?\d+\.?\d*)\s*g', line)
+                if match:
+                    self.sensor_data['accel_x'] = float(match.group(1))
+                    self.sensor_data['accel_y'] = float(match.group(2))
+                    self.sensor_data['accel_z'] = float(match.group(3))
+            
+            # Parse MPU6050 Gyroscope
+            elif "Gyro:" in line:
+                match = re.search(r'X=\s*([+-]?\d+\.?\d*)°/s.*Y=\s*([+-]?\d+\.?\d*)°/s.*Z=\s*([+-]?\d+\.?\d*)°/s', line)
+                if match:
+                    self.sensor_data['gyro_x'] = float(match.group(1))
+                    self.sensor_data['gyro_y'] = float(match.group(2))
+                    self.sensor_data['gyro_z'] = float(match.group(3))
+            
+            # Parse MPU6050 Temperature
+            elif "Temp:" in line and "MPU" not in line:
+                match = re.search(r'(\d+\.?\d*)\s*°C', line)
+                if match:
+                    self.sensor_data['temp_mpu'] = float(match.group(1))
+            
+            # Parse MAX30102
+            elif "Red LED:" in line:
+                match = re.search(r'(\d+)', line)
+                if match:
+                    red_val = int(match.group(1))
+                    self.sensor_data['red_led'] = red_val
+                    
+                    # Add to buffer for HR calculation
+                    self.red_buffer.append(red_val)
+                    if len(self.red_buffer) > self.buffer_size:
+                        self.red_buffer.pop(0)
+            
+            elif "IR  LED:" in line:
+                match = re.search(r'(\d+)', line)
+                if match:
+                    ir_val = int(match.group(1))
+                    self.sensor_data['ir_led'] = ir_val
+                    
+                    # Add to buffer
+                    self.ir_buffer.append(ir_val)
+                    if len(self.ir_buffer) > self.buffer_size:
+                        self.ir_buffer.pop(0)
+            
+            elif "R/IR Ratio:" in line:
+                match = re.search(r'(\d+\.?\d*)', line)
+                if match:
+                    self.sensor_data['ratio'] = float(match.group(1))
+                    
+                    # Calculate HR and SpO2 when we have enough data
+                    if len(self.red_buffer) >= 50:  # Need at least 50 samples
+                        self.sensor_data['heart_rate'] = self.calculate_heart_rate(self.red_buffer)
+                        self.sensor_data['spo2'] = self.calculate_spo2(self.sensor_data['ratio'])
+            
+            # Parse BMP280
+            elif "Temperature :" in line:
+                match = re.search(r'(\d+\.?\d*)\s*°C', line)
+                if match:
+                    self.sensor_data['temp_bmp'] = float(match.group(1))
+            
+            elif "Pressure" in line:
+                match = re.search(r'(\d+\.?\d*)\s*hPa', line)
+                if match:
+                    self.sensor_data['pressure'] = float(match.group(1))
+            
+            elif "Altitude" in line:
+                match = re.search(r'(\d+\.?\d*)\s*m', line)
+                if match:
+                    self.sensor_data['altitude'] = float(match.group(1))
+                    
+        except Exception as e:
+            print(f"Parse error: {e}")
+    
+    def read_serial(self):
+        import time
+        buffer = ""
+        while self.running:
+            try:
+                if self.serial_port and self.serial_port.is_open:
+                    # Read all available data at once
+                    if self.serial_port.in_waiting:
+                        data = self.serial_port.read(self.serial_port.in_waiting).decode('utf-8', errors='ignore')
+                        buffer += data
+                        
+                        # Process complete lines
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line = line.strip()
+                            if line:
+                                self.parse_serial_data(line)
+                        
+                        # Update display immediately after processing
+                        self.root.after(0, self.update_displays)
+                    else:
+                        time.sleep(0.001)  # Very short sleep when no data
+                else:
+                    time.sleep(0.01)
+            except Exception as e:
+                print(f"Serial read error: {e}")
+                time.sleep(0.05)
+    
+    def update_displays(self):
+        try:
+            import time
+            
+            # Integrate gyroscope data for horizon
+            current_time = time.time()
+            if self.last_update_time is not None:
+                dt = current_time - self.last_update_time
+                
+                # Only update if dt is reasonable (avoid huge jumps)
+                if dt < 0.5:  # Less than 500ms
+                    # Integrate gyro rates to get angles
+                    self.integrated_roll += self.sensor_data['gyro_x'] * dt
+                    self.integrated_pitch += self.sensor_data['gyro_y'] * dt
+                    
+                    # Limit angles to reasonable range
+                    self.integrated_roll = max(-180, min(180, self.integrated_roll))
+                    self.integrated_pitch = max(-90, min(90, self.integrated_pitch))
+                    
+                    # Update horizon display
+                    self.horizon.update_attitude(self.integrated_roll, self.integrated_pitch)
+                    self.roll_label.config(text=f"Roll: {self.integrated_roll:.1f}°")
+                    self.pitch_label.config(text=f"Pitch: {self.integrated_pitch:.1f}°")
+            
+            self.last_update_time = current_time
+            
+            # Update gyro rates
+            self.gyro_label.config(
+                text=f"X: {self.sensor_data['gyro_x']:.2f}  Y: {self.sensor_data['gyro_y']:.2f}  Z: {self.sensor_data['gyro_z']:.2f} °/s"
+            )
+            
+            # Update sensor displays (less frequently to reduce load)
+            self.temp_display.update_value(self.sensor_data['temp_bmp'])
+            self.pressure_display.update_value(self.sensor_data['pressure'])
+            self.altitude_display.update_value(self.sensor_data['altitude'])
+            self.temp_mpu_display.update_value(self.sensor_data['temp_mpu'])
+            
+            # Heart rate and SpO2 (show -- if no finger detected)
+            if self.sensor_data['red_led'] < 10000:
+                self.hr_display.update_value('--')
+                self.spo2_display.update_value('--')
+            else:
+                self.hr_display.update_value('72')  # Placeholder
+                self.spo2_display.update_value('98')  # Placeholder
+            
+            # Update accelerometer
+            self.accel_label.config(
+                text=f"X: {self.sensor_data['accel_x']:.2f}g  Y: {self.sensor_data['accel_y']:.2f}g  Z: {self.sensor_data['accel_z']:.2f}g"
+            )
+            
+            # Update LED readings
+            self.led_label.config(
+                text=f"Red: {self.sensor_data['red_led']}  IR: {self.sensor_data['ir_led']}"
+            )
+            
+        except Exception as e:
+            print(f"Display update error: {e}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = AvionicDisplayGUI(root)
+    root.geometry("950x650")
+    root.mainloop()
